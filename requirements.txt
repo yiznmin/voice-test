@@ -83,8 +83,6 @@ soxr==1.0.0
 speechbrain==1.0.3
 sympy==1.14.0
 threadpoolctl==3.6.0
-torch==2.1.0+cpu
-torchaudio==2.1.0+cpu
 tqdm==4.67.3
 triton==3.6.0
 typer==0.24.0
