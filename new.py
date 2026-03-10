@@ -187,7 +187,11 @@ with sd.InputStream(
 
             # ===== 狀態機更新 =====
             detected = state_machine.update(top_lang_code, top_prob_val)
-
+            # 啟動階段：尚未鎖定語言
+            if state_machine.locked is None:
+                display_lang = "en" if detected == "UNKNOWN" else detected
+            else:
+                display_lang = detected
             # ===== frame rate 計算 =====
             frames_processed = len(vad_frames) / FRAME_SIZE
             frame_rate_per_sec = frames_processed / STREAM_WINDOW
@@ -207,7 +211,7 @@ with sd.InputStream(
             print(f"📊 Avg Inference : {avg_time:.3f}s")
             print(f"📊 Frames/sec    : {frame_rate_per_sec:.1f}")
             print("🎯 Detected Language:")
-            print(f"{detected} ({top_prob_val*100:.2f}%)\n")
+            print(f"{display_lang} ({top_prob_val*100:.2f}%)")
             print("Top-5 Confidence:")
             for i in range(5):
                 print_confidence_bar(top5_langs[i], top5_prob[0][i].item())
