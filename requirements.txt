@@ -1,0 +1,9 @@
+# Language Detection requirements
+
+numpy
+openai-whisper
+torch
+
+# Streaming
+sounddevice
+webrtcvad
