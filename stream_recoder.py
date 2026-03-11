@@ -10,6 +10,8 @@
 import time
 import logging
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import sys
 import os
 
@@ -110,6 +112,10 @@ class StreamRecognizer:
         self._stop = False
         self._vad = None
         self._state = LanguageStateMachine(self.config)
+        self._lang_executor = ThreadPoolExecutor(max_workers=1) if self.config.parallel_language_detection else None
+        self._lang_future = None
+        self._last_lang_result = None
+        self._model_lock = threading.Lock()
 
         self._init_dependencies()
 
@@ -167,35 +173,84 @@ class StreamRecognizer:
         audio_float = np.array(vad_frames, dtype=np.float32) / 32768.0
         return audio_float
 
-    def _infer(self, audio_float: np.ndarray) -> dict:
-        # Whisper 語言偵測
-        audio_padded = whisper.pad_or_trim(audio_float)
-        mel = whisper.log_mel_spectrogram(audio_padded).to(self.model.device)
-        _, probs = self.model.detect_language(mel)
-        detected_lang = max(probs, key=probs.get)
-        confidence = float(probs[detected_lang])
-
-        # 使用狀態機穩定語言
-        stable_lang = self._state.update(detected_lang, confidence)
-        lang_for_text = stable_lang if stable_lang != "UNKNOWN" else detected_lang
-
-        # 顯示語言規則:
-        # 1) 初始未鎖定時先顯示英文
-        # 2) 一旦曾鎖定過，未穩定時顯示 UNKNOWN
-        if self._state.locked is None and not self._state.has_locked_once:
-            display_lang = "en"
-        elif self._state.locked is None:
-            display_lang = "UNKNOWN"
+    def _detect_language_topk(self, audio_float: np.ndarray, allow_skip: bool = False) -> dict:
+        if allow_skip:
+            acquired = self._model_lock.acquire(blocking=False)
+            if not acquired:
+                return None
         else:
-            display_lang = self._state.locked
+            self._model_lock.acquire()
 
-        # Whisper 轉寫文字
+        start = time.perf_counter()
+        try:
+            audio_padded = whisper.pad_or_trim(audio_float)
+            mel = whisper.log_mel_spectrogram(audio_padded).to(self.model.device)
+            _, probs = self.model.detect_language(mel)
+            topk = sorted(probs.items(), key=lambda x: x[1], reverse=True)[: self.config.topk_languages]
+            detected_lang, confidence = topk[0]
+            detect_ms = (time.perf_counter() - start) * 1000.0
+            return {
+                "detected_lang": detected_lang,
+                "confidence": float(confidence),
+                "topk": topk,
+                "detect_ms": detect_ms,
+            }
+        finally:
+            self._model_lock.release()
+
+    def _get_latest_language(self, audio_float: np.ndarray) -> dict:
+        if self._lang_future and self._lang_future.done():
+            try:
+                latest = self._lang_future.result()
+                if latest:
+                    self._last_lang_result = latest
+                    self._last_lang_result["stable_lang"] = self._state.update(
+                        self._last_lang_result["detected_lang"],
+                        self._last_lang_result["confidence"],
+                    )
+            except Exception as exc:
+                self.logger.exception("語言偵測背景執行失敗: %s", exc)
+            finally:
+                self._lang_future = None
+
+        if self._last_lang_result is None:
+            self._last_lang_result = self._detect_language_topk(audio_float, allow_skip=False)
+            if self._last_lang_result:
+                self._last_lang_result["stable_lang"] = self._state.update(
+                    self._last_lang_result["detected_lang"],
+                    self._last_lang_result["confidence"],
+                )
+
+        if self._lang_executor and self._lang_future is None:
+            audio_copy = np.array(audio_float, copy=True)
+            self._lang_future = self._lang_executor.submit(self._detect_language_topk, audio_copy, True)
+
+        return self._last_lang_result
+
+    def _transcribe(self, audio_float: np.ndarray, language: str) -> dict:
+        start = time.perf_counter()
         use_fp16 = self.model.device.type == "cuda"
-        transcribe_result = self.model.transcribe(
-            audio_float,
-            language=lang_for_text,
-            fp16=use_fp16
-        )
+        with self._model_lock:
+            transcribe_result = self.model.transcribe(
+                audio_float,
+                language=language,
+                fp16=use_fp16
+            )
+        transcribe_ms = (time.perf_counter() - start) * 1000.0
+        return {
+            "result": transcribe_result,
+            "transcribe_ms": transcribe_ms,
+        }
+
+    def _infer(self, audio_float: np.ndarray, lang_result: dict) -> dict:
+        detected_lang = lang_result["detected_lang"]
+        confidence = lang_result["confidence"]
+        stable_lang = lang_result.get("stable_lang", "UNKNOWN")
+        lang_for_text = stable_lang if stable_lang != "UNKNOWN" else detected_lang
+        display_lang = lang_for_text
+
+        transcribe_out = self._transcribe(audio_float, lang_for_text)
+        transcribe_result = transcribe_out["result"]
 
         return {
             "success": True,
@@ -203,6 +258,9 @@ class StreamRecognizer:
             "language_name": LANGUAGE_NAMES.get(display_lang, display_lang),
             "raw_language": detected_lang,
             "confidence": confidence,
+            "top5": lang_result.get("topk", []),
+            "detect_ms": lang_result.get("detect_ms", 0.0),
+            "transcribe_ms": transcribe_out["transcribe_ms"],
             "text": transcribe_result.get("text", "").strip(),
             "audio_duration": len(audio_float) / self.config.sample_rate,
         }
@@ -233,12 +291,24 @@ class StreamRecognizer:
                         time.sleep(0.01)
                         continue
 
+                    collect_start = time.perf_counter()
                     audio_float = self._collect_window()
                     if audio_float is None:
                         continue
+                    collect_ms = (time.perf_counter() - collect_start) * 1000.0
 
                     self._last_infer_time = now
-                    result = self._infer(audio_float)
+                    lang_result = self._get_latest_language(audio_float)
+                    infer_start = time.perf_counter()
+                    result = self._infer(audio_float, lang_result)
+                    infer_ms = (time.perf_counter() - infer_start) * 1000.0
+                    result["timing"] = {
+                        "collect_ms": collect_ms,
+                        "detect_ms": result.get("detect_ms", 0.0),
+                        "transcribe_ms": result.get("transcribe_ms", 0.0),
+                        "infer_ms": infer_ms,
+                        "total_ms": collect_ms + infer_ms,
+                    }
 
                     if on_result:
                         on_result(result)
@@ -258,9 +328,25 @@ class StreamRecognizer:
         conf = result.get("confidence", 0.0)
         text = result.get("text", "")
         duration = result.get("audio_duration", 0.0)
+        top5 = result.get("top5", [])
+        timing = result.get("timing", {})
 
         print("\n" + "=" * 60)
         print(f"語言 : {lang_name} ({lang})  信心={conf:.2%}  長度={duration:.2f}s")
+        if top5:
+            top5_text = ", ".join(
+                f"{LANGUAGE_NAMES.get(code, code)}({code})={prob:.2%}"
+                for code, prob in top5
+            )
+            print(f"Top5 : {top5_text}")
+        if timing:
+            print(
+                "時間 : "
+                f"collect={timing.get('collect_ms', 0.0):.1f}ms, "
+                f"detect={timing.get('detect_ms', 0.0):.1f}ms, "
+                f"transcribe={timing.get('transcribe_ms', 0.0):.1f}ms, "
+                f"total={timing.get('total_ms', 0.0):.1f}ms"
+            )
         if text:
             print(f"文字 : {text}")
         else:
@@ -268,6 +354,8 @@ class StreamRecognizer:
 
     def close(self):
         self.stop()
+        if self._lang_executor:
+            self._lang_executor.shutdown(wait=False, cancel_futures=True)
         self.model = None
 
     def __enter__(self):

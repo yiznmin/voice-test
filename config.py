@@ -44,3 +44,7 @@ class StreamConfig:
     stable_count: int = 3
     switch_count: int = 4
     switch_threshold: float = 0.93
+
+    # 語言偵測輸出與並行設定
+    topk_languages: int = 5
+    parallel_language_detection: bool = True
