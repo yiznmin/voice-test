@@ -48,3 +48,13 @@ class StreamConfig:
     # 語言偵測輸出與並行設定
     topk_languages: int = 5
     parallel_language_detection: bool = True
+
+
+@dataclass
+@dataclass
+class ModelConfig:
+    """模型與裝置設定"""
+    classifier_device: str = "cpu"  # SpeechBrain / Denoiser 用的裝置
+    whisper_device: str = "cpu"     # Whisper 用的裝置
+    use_denoiser: bool = True
+    classifier_source: str = "speechbrain/lang-id-voxlingua107-ecapa"

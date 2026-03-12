@@ -3,6 +3,8 @@
 numpy
 openai-whisper
 torch
+speechbrain
+denoiser
 
 # Streaming
 sounddevice

@@ -16,8 +16,14 @@ import argparse
 import sys
 import os
 
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except Exception:
+    TORCH_AVAILABLE = False
+
 from stream_recoder import StreamRecognizer
-from config import StreamConfig
+from config import StreamConfig, ModelConfig
 
 # 強制 UTF-8 輸出，避免 Windows 終端機顯示亂碼
 os.environ.setdefault("PYTHONUTF8", "1")
@@ -58,6 +64,9 @@ def main():
     parser.add_argument("--device", default=None,
                         choices=["cpu", "cuda"],
                         help="運算設備 (cpu/cuda)")
+    parser.add_argument("--classifier-device", default="cpu",
+                        choices=["cpu", "cuda"],
+                        help="語言分類/降噪設備 (預設: cpu)")
 
     # 即時串流參數
     parser.add_argument("--stream", action="store_true",
@@ -91,9 +100,25 @@ def main():
     if args.stream_vad is not None:
         stream_config.vad_aggressiveness = args.stream_vad
 
+    # === 預設裝置：Whisper 走 GPU(若可用)，否則 CPU ===
+    device = args.device
+    if device is None:
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            device = "cuda"
+        else:
+            device = "cpu"
+
+    model_config = ModelConfig(
+        classifier_device=args.classifier_device,
+        whisper_device=device,
+    )
+
     # === 啟動即時辨識 ===
-    with StreamRecognizer(model_name=args.model, device=args.device,
-                          stream_config=stream_config) as recognizer:
+    with StreamRecognizer(
+        model_name=args.model,
+        stream_config=stream_config,
+        model_config=model_config,
+    ) as recognizer:
         recognizer.run()
 
 
